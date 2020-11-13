@@ -9,12 +9,12 @@ namespace AssetStudio
     public class AssetsManager
     {
         public List<SerializedFile> assetsFileList = new List<SerializedFile>();
-        internal Dictionary<string, int> assetsFileIndexCache = new Dictionary<string, int>();
-        internal Dictionary<string, EndianBinaryReader> resourceFileReaders = new Dictionary<string, EndianBinaryReader>();
+        internal Dictionary<string, int> assetsFileIndexCache = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        internal Dictionary<string, BinaryReader> resourceFileReaders = new Dictionary<string, BinaryReader>(StringComparer.OrdinalIgnoreCase);
 
         private List<string> importFiles = new List<string>();
-        private HashSet<string> importFilesHash = new HashSet<string>();
-        private HashSet<string> assetsFileListHash = new HashSet<string>();
+        private HashSet<string> importFilesHash = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private HashSet<string> assetsFileListHash = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         public void LoadFiles(params string[] files)
         {
@@ -37,7 +37,7 @@ namespace AssetStudio
             foreach (var file in files)
             {
                 importFiles.Add(file);
-                importFilesHash.Add(Path.GetFileName(file).ToUpper());
+                importFilesHash.Add(Path.GetFileName(file));
             }
 
             Progress.Reset();
@@ -75,21 +75,21 @@ namespace AssetStudio
         private void LoadAssetsFile(string fullName, EndianBinaryReader reader)
         {
             var fileName = Path.GetFileName(fullName);
-            if (!assetsFileListHash.Contains(fileName.ToUpper()))
+            if (!assetsFileListHash.Contains(fileName))
             {
                 Logger.Info($"Loading {fileName}");
                 try
                 {
                     var assetsFile = new SerializedFile(this, fullName, reader);
                     assetsFileList.Add(assetsFile);
-                    assetsFileListHash.Add(assetsFile.upperFileName);
+                    assetsFileListHash.Add(assetsFile.fileName);
 
                     foreach (var sharedFile in assetsFile.m_Externals)
                     {
-                        var sharedFilePath = Path.GetDirectoryName(fullName) + "\\" + sharedFile.fileName;
+                        var sharedFilePath = Path.Combine(Path.GetDirectoryName(fullName), sharedFile.fileName);
                         var sharedFileName = sharedFile.fileName;
 
-                        if (!importFilesHash.Contains(sharedFileName.ToUpper()))
+                        if (!importFilesHash.Contains(sharedFileName))
                         {
                             if (!File.Exists(sharedFilePath))
                             {
@@ -103,7 +103,7 @@ namespace AssetStudio
                             if (File.Exists(sharedFilePath))
                             {
                                 importFiles.Add(sharedFilePath);
-                                importFilesHash.Add(sharedFileName.ToUpper());
+                                importFilesHash.Add(sharedFileName);
                             }
                         }
                     }
@@ -123,8 +123,7 @@ namespace AssetStudio
         private void LoadAssetsFromMemory(string fullName, EndianBinaryReader reader, string originalPath, string unityVersion = null)
         {
             var fileName = Path.GetFileName(fullName);
-            var upperFileName = fileName.ToUpper();
-            if (!assetsFileListHash.Contains(upperFileName))
+            if (!assetsFileListHash.Contains(fileName))
             {
                 try
                 {
@@ -135,15 +134,12 @@ namespace AssetStudio
                         assetsFile.SetVersion(unityVersion);
                     }
                     assetsFileList.Add(assetsFile);
-                    assetsFileListHash.Add(assetsFile.upperFileName);
+                    assetsFileListHash.Add(assetsFile.fileName);
                 }
                 catch
                 {
                     //Logger.Error($"Unable to load assets file {fileName} from {Path.GetFileName(originalPath)}");
-                }
-                finally
-                {
-                    resourceFileReaders.Add(upperFileName, reader);
+                    resourceFileReaders.Add(fileName, reader);
                 }
             }
         }
@@ -157,8 +153,16 @@ namespace AssetStudio
                 var bundleFile = new BundleFile(reader, fullName);
                 foreach (var file in bundleFile.fileList)
                 {
-                    var dummyPath = Path.GetDirectoryName(fullName) + "\\" + file.fileName;
-                    LoadAssetsFromMemory(dummyPath, new EndianBinaryReader(file.stream), parentPath ?? fullName, bundleFile.versionEngine);
+                    var subReader = new EndianBinaryReader(file.stream);
+                    if (SerializedFile.IsSerializedFile(subReader))
+                    {
+                        var dummyPath = Path.GetDirectoryName(fullName) + Path.DirectorySeparatorChar + file.fileName;
+                        LoadAssetsFromMemory(dummyPath, subReader, parentPath ?? fullName, bundleFile.m_Header.unityRevision);
+                    }
+                    else
+                    {
+                        resourceFileReaders.Add(file.fileName, subReader);
+                    }
                 }
             }
             catch
@@ -185,7 +189,7 @@ namespace AssetStudio
                 var webFile = new WebFile(reader);
                 foreach (var file in webFile.fileList)
                 {
-                    var dummyPath = Path.GetDirectoryName(fullName) + "\\" + file.fileName;
+                    var dummyPath = Path.Combine(Path.GetDirectoryName(fullName), file.fileName);
                     switch (CheckFileType(file.stream, out var fileReader))
                     {
                         case FileType.AssetsFile:
@@ -196,6 +200,9 @@ namespace AssetStudio
                             break;
                         case FileType.WebFile:
                             LoadWebFile(dummyPath, fileReader);
+                            break;
+                        case FileType.ResourceFile:
+                            resourceFileReaders.Add(file.fileName, fileReader);
                             break;
                     }
                 }
@@ -237,7 +244,6 @@ namespace AssetStudio
             Progress.Reset();
             foreach (var assetsFile in assetsFileList)
             {
-                assetsFile.Objects = new Dictionary<long, Object>(assetsFile.m_Objects.Count);
                 foreach (var objectInfo in assetsFile.m_Objects)
                 {
                     var objectReader = new ObjectReader(assetsFile.reader, assetsFile, objectInfo);
@@ -327,11 +333,14 @@ namespace AssetStudio
                             case ClassIDType.VideoClip:
                                 obj = new VideoClip(objectReader);
                                 break;
+                            case ClassIDType.ResourceManager:
+                                obj = new ResourceManager(objectReader);
+                                break;
                             default:
                                 obj = new Object(objectReader);
                                 break;
                         }
-                        assetsFile.Objects.Add(objectInfo.m_PathID, obj);
+                        assetsFile.AddObject(obj);
                     }
                     catch (Exception e)
                     {
@@ -355,7 +364,7 @@ namespace AssetStudio
 
             foreach (var assetsFile in assetsFileList)
             {
-                foreach (var obj in assetsFile.Objects.Values)
+                foreach (var obj in assetsFile.Objects)
                 {
                     if (obj is GameObject m_GameObject)
                     {
